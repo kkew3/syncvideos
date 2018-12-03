@@ -51,6 +51,8 @@ optional arguments:
 - **p**: go to previous frame;
 - **r**: go to the latest frame.
 
+To interact using above keymaps, the window focus should be on one of the opencv video windows rather than the console.
+
 # Dependency
 
 Developed under `Python 3.6.5`.
