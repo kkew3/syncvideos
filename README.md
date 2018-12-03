@@ -6,7 +6,7 @@ Play videos synchronously with automatic window placement by arranging windows i
 
 ## Command line argument
 
-```bash
+```plain
 usage: play-videos.py [-h] [--fps FPS] [-c {r,g}] [-s SCALE]
                       [--hw HEIGHT WIDTH] [-b] [-n CACHE]
                       VIDEO [VIDEO ...]
