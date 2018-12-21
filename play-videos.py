@@ -43,11 +43,11 @@ Example
 
 Play `video1' and `video1' side-by-side:
 
-    python playvideos.py -f video1 -l 0 0 -f video2 -l 0 1;
+    python play-videos.py -f video1 -l 0 0 -f video2 -l 0 1;
 
 Arrange all AVI videos in two rows:
 
-    find . -name '*.avi' -print | python playvideos.py -f- -L 2 x
+    find . -name '*.avi' -print | python play-videos.py -f- -L 2 x
 
 Custom frame preprocessing routine
 ----------------------------------
