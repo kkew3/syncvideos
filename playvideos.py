@@ -1,0 +1,734 @@
+#!/usr/bin/env python3 -O
+import argparse
+import math
+import os
+import re
+import sys
+import collections
+import importlib.machinery
+import importlib.util
+import typing
+from string import ascii_lowercase, digits
+import itertools
+from functools import partial
+from typing import List, Tuple, Callable, Sequence, Optional, Iterable
+
+import numpy as np
+import cv2
+from tqdm import tqdm
+
+from blllib import Pipeline, SequentialPipeline
+
+
+try:
+    from utils import frameiter
+except ImportError:
+    def frameiter(cap: cv2.VideoCapture, rgb: bool = True):
+        while cap.isOpened():
+            s, f = cap.read()
+            if not s:
+                break
+            if len(f.shape) == 3 and f.shape[2] == 2 and rgb:
+                f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+            yield f
+
+
+if __debug__:
+    import pdb
+
+
+def import_routine(filename) -> str:
+    name = os.path.splitext(os.path.basename(filename))[0]
+    loader = importlib.machinery.SourceFileLoader(name, filename)
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    if name in sys.modules and (not hasattr(sys.modules[name], '__file__')
+                                or (sys.modules[name].__file__
+                                    != mod.__file__)):
+        raise ValueError('{} already exists'.format(name))
+    elif name not in sys.modules:
+        sys.modules[name] = mod
+        return mod
+    else:
+        return sys.modules[name]
+
+
+__keymap_instruction__ = '''
+    b)    pause the videos;
+    c)    continue playing the videos at normal speed;
+    [N]g) show current frame ID on console; if N is provided, where N is one
+          digit (0-9), what will be printed is "$frame_id/$N"
+    h)    show help on console;
+    [N]j) skip N new frames; this command fails unless following `r'
+    l)    go to the earliest frame within the rewind limit;
+    n)    go to the next frame
+    Nn)   repeat `n' N times until hitting the frame induced by `r';
+    [N]p) repeat `p' N times until hitting the frame induced by `l';
+    r)    go to the latest frame already played.
+
+    where N is a positive integer
+'''[1:-1]
+
+__description__ = '''
+Play videos synchronously with automatic window placement.
+
+Keymaps
+-------
+
+{}
+
+Example
+-------
+
+Play `video1' and `video1' side-by-side:
+
+    python playvideos.py -f video1 -l 0 0 -f video2 -l 0 1;
+
+Arrange all AVI videos in two rows:
+
+    find . -name '*.avi' -print | python playvideos.py -f- -L 2 x
+
+Custom frame preprocessing routine
+----------------------------------
+
+Routines can be injected at runtime by giving python files defining them.
+The routines will be chained such that the result from the ith routine
+will be fed as input into the (i+1)th routine. Each file defines one and
+only one routine.
+
+The files defining a routine should be named such that it can be imported.
+Each file defining a routine must contain a function named `frame_processor`
+that expects no argument and returns a callable object, denoted as `fp`. The
+callable object should behave the same as the following function signature:
+
+    Callable[[List[Tuple[Tuple[int, int], Optional[np.ndarray]]]],
+             List[Tuple[Tuple[int, int], Optional[np.ndarray]]]]
+
+where the input argument `cl_frames' is a list of tuples
+(cell_location, frame). For example,
+
+    [((0,0),frame1), ((0,1),frame2), ((1,0),frame3)]
+
+means frame1 at upper left, frame2 at upper right, frame3 at lower left,
+nothing (blank) at lower right. If `frame' is `None', then the cell
+located at `cell_location' is empty. For example,
+
+    [((0,0),frame1), ((0,1),frame2), ((1,0),frame3)]
+
+is equivalent to
+
+    [((0,0),frame1), ((0,1),frame2), ((1,0),frame3), ((1,1),None)]
+
+The returned value is of the same format as the input list, but does not
+necessarily maintain the same length. For example, given the input list
+
+    [((0,0),frame1), ((0,1),frame2)]
+
+the returned list can be
+
+    [((0,0),frame1'), ((0,1),frame2'), ((1,0),frame1), ((1,1),frame2)]
+
+
+                      == End of description ==
+'''.format(__keymap_instruction__).lstrip()
+
+
+GridFrameType = Sequence[Tuple[Tuple[int, int], Optional[np.ndarray]]]
+"""Frame and its location in grid: [(location, frame)]"""
+GridVideoType = Sequence[Tuple[Tuple[int, int], Iterable[np.ndarray]]]
+"""Video source and its location in grid: [(location, frame_iterator)]"""
+VideoMatrixType = List[List[Optional[typing.Iterator[np.ndarray]]]]
+"""Video sources arranged in grid: [[frame_iterator]]"""
+
+
+class ChangeColorMode(object):
+    stateful = False
+    run_in_master = True
+
+    def __init__(self, colored: bool):
+        self.colored = colored
+
+    def __call__(self, cl_frames: GridFrameType) -> GridFrameType:
+        new_cl_frames = []
+        for cl, f in cl_frames:
+            if f is not None:
+                if len(f.shape) == 2 and self.colored:
+                    f = cv2.cvtColor(f, cv2.COLOR_GRAY2BGR)
+                elif (len(f.shape) == 3 and f.shape[2] == 3
+                      and not self.colored):
+                    f = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+            new_cl_frames.append((cl, f))
+        return new_cl_frames
+
+
+class GridFramesIterator(object):
+    def __init__(self, sources: GridVideoType, zip_longest: bool):
+        self.sources = sources
+        self.zip_longest = zip_longest
+
+        if len(set(x[0] for x in sources)) < len(sources):
+            raise ValueError('cell location must be unique for each cell')
+        grid_shape = (1 + max(s[0][0] for s in sources),
+                      1 + max(s[0][1] for s in sources))
+        grid = [[None for _ in range(grid_shape[1])]
+                for _ in range(grid_shape[0])]  # type: VideoMatrixType
+        for cl, frames in sources:
+            grid[cl[0]][cl[1]] = iter(frames)
+        self.grid = grid
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        frames = []
+        succeed = False
+        for i in range(len(self.grid)):
+            for j in range(len(self.grid[0])):
+                try:
+                    f = next(self.grid[i][j])
+                except StopIteration:
+                    if self.zip_longest:
+                        frames.append(((i, j), None))
+                    else:
+                        raise
+                except TypeError:
+                    pass
+                else:
+                    frames.append(((i, j), f))
+                    succeed = True
+        if not succeed:
+            raise StopIteration
+        return frames
+
+
+class RenderCanvas(object):
+    stateful = True
+    run_in_master = True
+
+    def __init__(self, margin: int):
+        self.margin = margin
+        self.rt = {}  # runtime parameters
+
+    def __call__(self, cl_frames: GridFrameType) -> np.ndarray:
+        if not self.rt:
+            caxis = next((f.shape[2:] for _, f in cl_frames if f is not None))
+            grid_shape_rt = tuple(1 + np.max(
+                [cl for cl, _ in cl_frames], axis=0))
+            gp_shape = np.zeros((2,) + grid_shape_rt, dtype=np.int64)
+            for (i, j), f in cl_frames:
+                gp_shape[:, i, j] = (0, 0) if f is None else f.shape[:2]
+            row_heights = np.cumsum(np.max(gp_shape[0], axis=1) + self.margin)
+            col_widths = np.cumsum(np.max(gp_shape[1], axis=0) + self.margin)
+            canvas_height = row_heights[-1] - self.margin
+            canvas_width = col_widths[-1] - self.margin
+            self.rt['coloraxis'] = caxis
+            self.rt['grid_shape_rt'] = grid_shape_rt
+            self.rt['canvas_shape'] = canvas_height, canvas_width
+            self.rt['ll_coors'] = (row_heights - self.margin,
+                                   col_widths - self.margin)
+
+        canvas = np.zeros(self.rt['canvas_shape'] + self.rt['coloraxis'],
+                          dtype=np.uint8)
+        for (i, j), f in cl_frames:
+            if f is not None:
+                fh, fw = f.shape[:2]
+                ful = (self.rt['ll_coors'][0][i] - fh,
+                       self.rt['ll_coors'][1][j] - fw)
+                canvas[ful[0]:ful[0] + fh, ful[1]:ful[1] + fw] = f
+        return canvas
+
+
+class EmptyVideosError(BaseException):
+    """
+    Raised if none of the videos contains any frame.
+    """
+    pass
+
+
+class IllegalStateError(BaseException):
+    """
+    Raised if an operation is applied to the video player at a wrong state.
+    Several factory methods are provided for different illegal player
+    operations.
+    """
+    @classmethod
+    def navigate_without_paused(cls, direction):
+        if direction.startswith('f'):
+            direction = 'forward'
+        elif direction.startswith('b'):
+            direction = 'backward'
+        return cls('Cannot navigate {} unless paused'.format(direction))
+
+    @classmethod
+    def navigate_beyond_played_frames(cls):
+        return cls('Cannot navigate forward to frames not played before')
+
+    @classmethod
+    def navigate_beyond_rewind_limit(cls):
+        return cls('Cannot navigate backward to frames beyond rewind limit')
+
+    @classmethod
+    def skip_at_nonlatest_frame(cls):
+        return cls('Cannot skip frames unless current frame is the latest '
+                   'frame already played')
+
+
+class VideoPlayer(object):
+    """
+    A ``VideoPlayer`` play one or more videos simultaneously in cells
+    arranged in a grid. The location of each cell is specified by coordinate
+    (x,y), 0-indexed, with row-id as x and column-id as y.
+    """
+
+    def __init__(self, *sources, colored=False, fps=6.0,
+                 margin=1, zip_longest=True, rewind_limit=100,
+                 frame_processors: Sequence[Callable] = (),
+                 n_cpu: int = None) -> None:
+        """
+        :param sources: tuple(s) of ``(cell_location, frames)``, where
+               ``cell_location`` is a int-tuple (x,y) indicating its cell
+               location, and ``frames`` is an iterable of frames
+        :param fps: default to 6 frames/sec
+        :param colored: ``False`` to display in grayscale, otherwise in BGR
+               color -- (B)lue/(G)reen/(R)ed
+        :param margin: width of row/column margin in pixel
+        :param zip_longest: ``True`` to stop all videos if all videos have
+               stopped, otherwise to stop all videos if any one video has
+               stopped
+        :param rewind_limit: maximum number of frames to rewind
+        :param frame_processor: a callable object that accepts a list of
+               tuples ``(cell_location, Optional[frame])`` and returns a list
+               of tuples of the same format, where ``None`` frame indicates
+               empty cell *throughout* the video (due to layout)
+        :param n_cpu: an integer to enable multiprocessing, such
+               that a positive integer specifies the maximum processes and a
+               non-positive integer leads to the default maximum processes; or
+               ``None`` to disable multiprocessing
+        """
+        frame_processors = list(frame_processors)
+        frame_processors.insert(0, ChangeColorMode(colored))
+        frame_processors.append(RenderCanvas(margin))
+        frames_iter = GridFramesIterator(sources, zip_longest)
+        if n_cpu is not None:
+            if n_cpu < 1:
+                n_cpu = None
+            pipeline = Pipeline(frame_processors, n_cpu=n_cpu)
+        else:
+            pipeline = SequentialPipeline(frame_processors)
+        pipeline.apply(frames_iter)
+        self.pipeline = pipeline
+        self.pipeline_it = iter(self.pipeline)
+
+        # used when playing videos in normal mode (not paused)
+        self.fps = fps
+
+        # used to rewinding back previous frames
+        self.cache = collections.deque(maxlen=max(1, rewind_limit))
+
+        # runtime switches
+        self.paused = False
+        self.quiet = False
+
+        # readonly signals
+        self.cache_pointer = 0
+        self.frame_counter = 0
+        self.eof = False
+
+    def _render_new(self):
+        canvas = next(self.pipeline_it)
+        self.cache.append((self.frame_counter, canvas))
+        self.frame_counter += 1
+        return canvas
+
+    def _render_old(self) -> np.ndarray:
+        """
+        Render the next frame by iterating along ``self.cache``.
+
+        :return: the next frame of dtype ``numpy.uint8``
+        """
+        canvas = self.cache[self.cache_pointer][1]
+        self.cache_pointer += 1
+        return canvas
+
+    def render(self) -> Optional[str]:
+        """
+        Render frame and get keyboard interaction.
+
+        :return: the key pressed
+        """
+        if self.paused and not len(self.cache):
+            raise EmptyVideosError
+        if self.paused and len(self.cache):
+            self.cache_pointer -= 1
+        try:
+            if self.cache_pointer:
+                canvas = self._render_old()
+            else:
+                canvas = self._render_new()
+        except StopIteration:
+            self._set_eof()
+            self.pause()
+            return self.render()
+        else:
+            cv2.imshow(self.window_name, canvas)
+            key = cv2.waitKey(int(np.round(1000 / self.fps))) & 0xFF
+            if key == 0xFF:
+                return None
+            else:
+                return chr(key)
+
+    def skip(self, n=1):
+        if self.cache_pointer:
+            raise IllegalStateError.skip_at_nonlatest_frame()
+        try:
+            it = range(n)
+            if not self.quiet:
+                it = tqdm(it, ascii=True, unit='fr')
+            for _ in it:
+                _ = self._render_new()
+        except StopIteration:
+            self._set_eof()
+
+    def _set_eof(self):
+        self.eof = True
+        if not self.quiet:
+            print('EOF reached', file=sys.stderr)
+
+    def pause(self):
+        self.paused = True
+
+    def close(self):
+        self.pipeline.close()
+
+    def prevf(self, n=1):
+        for _ in range(n):
+            if not self.paused:
+                raise IllegalStateError.navigate_without_paused('b')
+            else:
+                if self.cache_pointer - 1 < 1 - len(self.cache):
+                    raise IllegalStateError.navigate_beyond_rewind_limit()
+                self.cache_pointer -= 1
+                #self.cache_pointer = max(1 - len(self.cache), self.cahce_pointer - 1)
+
+    def nextf(self, n=1):
+        for _ in range(n):
+            if not self.paused:
+                raise IllegalStateError.navigate_without_paused('f')
+            if self.cache_pointer + 1 > 1:
+                raise IllegalStateError.navigate_beyond_played_frames()
+            self.cache_pointer += 1
+            #self.cache_pointer = min(1, self.cache_pointer + 1)
+
+    def pprevf(self):
+        if not self.paused:
+            raise IllegalStateError.navigate_without_paused('b')
+        if len(self.cache):
+            self.cache_pointer = 1 - len(self.cache)
+
+    def nnextf(self):
+        if not self.paused:
+            raise IllegalStateError.navigate_without_paused('f')
+        if len(self.cache):
+            self.cache_pointer = 0
+
+    def cont(self):
+        self.paused = False
+
+    def do_nothing(self):
+        # intended to be empty
+        pass
+
+    def print_progress(self, comment=None):
+        if comment is not None:
+            print(self.frame_id, comment, sep='/')
+        else:
+            print(self.frame_id)
+
+    @property
+    def frame_id(self):
+        fid = self.frame_counter - 1
+        if self.cache_pointer:
+            fid += self.cache_pointer
+        return fid
+
+    @property
+    def window_name(self):
+        return 'videos'
+
+
+def make_parser():
+    parser = argparse.ArgumentParser(
+        description=__description__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('-f', '--video-file', dest='videos',
+                        metavar='VIDEO', action='append',
+                        help='the video(s) to play at sync; or `-\' to read '
+                             'video filenames from stdin, one per line')
+    l_group = parser.add_argument_group('Layout specification')
+    l_group.add_argument('-L', '--grid-shape', metavar=('NROWS', 'NCOLS'),
+                         nargs=2, dest='grid_shape', default=(1, 1),
+                         help='the grid shape, default to 1 1, where at '
+                              'least one of NROWS '
+                              'and NCOLS should be a positive integer; the '
+                              'one that\'s not a positive integer will be '
+                              'regarded as undefined dimension; this option '
+                              'will be ignored unless `-l X Y\' is not '
+                              'specified')
+    l_group.add_argument('-l', '--location', nargs=2,
+                         metavar=('X', 'Y'), dest='locations',
+                         action='append',
+                         help='the ith location corresponds to the ith VIDEO')
+
+    v_group = parser.add_argument_group('Video specification')
+    v_group.add_argument('--fps', type=float, default=6.0,
+                         help='the frame-per-second; default to %(default)s')
+    v_group.add_argument('-c', '--colored', action='store_true',
+                         help='to load frames in BGR color; if not '
+                              'specified, load frames in grayscale')
+
+    fp_group = parser.add_argument_group('Frame processors')
+    fp_group.add_argument('-r', '--routine', action='append', metavar='FILE',
+                          help='file that defines a custom frame processor')
+
+    b_group = parser.add_argument_group('Runtime behavior')
+    b_group.add_argument('-b', '--freeze-once-start', dest='freeze_once_start',
+                         action='store_true',
+                         help='to freeze the videos once started')
+    b_group.add_argument('-n', '--cache-size', type=int, default=100,
+                         dest='cache',
+                         help='how many number of frames the video player is '
+                              'able to rewind; should be no less than 1; '
+                              'default to %(default)s. '
+                              'There is a limit because the '
+                              'program cache last CACHE frames on the run. The'
+                              ' reason why ffmpeg backend is not used because '
+                              'it is not reliable (see '
+                              'https://github.com/opencv/opencv/issues/9053).')
+    b_group.add_argument('-P', '--max-procs', dest='max_procs', type=int,
+                         nargs='?', const='-1',
+                         help='specify this option to enable multiprocessing.'
+                              ' The number of CPU cores allocated will be '
+                              'MAX_PROCS if it\'s positive. Default to '
+                              'disable multiprocessing')
+    b_group.add_argument('-g', '--goto', dest='start_frame',
+                         metavar='START_FRAME_ID', default=0, type=int,
+                         help='Start the videos at frame START_FRAME_ID')
+    b_group.add_argument('--progress', choices=('never', 'auto', 'always'),
+                         default='auto', dest='show_progress_when_goto',
+                         help='whether to show progress bar when using `'
+                              '--goto\' option; default to `auto\', where '
+                              'progress bar is shown when START_FRAME_ID is '
+                              'at least 100. Option `--quiet\' implies '
+                              '`--progress never\'')
+    b_group.add_argument('-q', '--quiet', action='store_true')
+
+    return parser
+
+
+keymap = {
+    'b': 'pause',
+    'c': 'cont',
+    'g': 'print_progress',
+    'j': 'skip',
+    'l': 'pprevf',
+    'n': 'nextf',
+    'p': 'prevf',
+    'r': 'nnextf',
+}
+for i in range(2, 1000):
+    keymap['{}n'.format(i)] = 'nextf', i
+    keymap['{}p'.format(i)] = 'prevf', i
+    keymap['{}j'.format(i)] = 'skip', i
+for i in range(10):
+    keymap['{}g'.format(i)] = 'print_progress', i
+
+
+KSeqNode = collections.namedtuple('KSeqNode', ('val', 'action', 'children'))
+
+
+class CommonPrefixError(BaseException):
+    pass
+
+
+def add_keyseq(kseqtree, string, action, **kwargs):
+    try:
+        original = kwargs['original']
+    except KeyError:
+        original = string
+    if not string:
+        if kseqtree.children:
+            raise CommonPrefixError()
+        kseqtree.action = action
+    else:
+        for child in kseqtree.children:
+            if string[0] == child.val:
+                add_keyseq(child, string[1:], action, original=original)
+                break
+        else:
+            for i, c in enumerate(string):
+                if i + 1 == len(string):
+                    new_child = KSeqNode(c, action, [])
+                else:
+                    new_child = KSeqNode(c, None, [])
+                kseqtree.children.append(new_child)
+                kseqtree = new_child
+
+
+def compile_keymap():
+    tree = KSeqNode(None, None, [])
+    augkeymap = dict(keymap)
+    augkeymap.update((('h', 'help'), ('q', 'quit')))
+    for k, a in augkeymap.items():
+        add_keyseq(tree, k, a)
+    return tree
+
+
+def traverse_kmtree(tree, c):
+    """
+    Returns ``None`` if the underlying sequence is not found in the compiled
+    partial keymap, i.e. ``tree``. Otherwise, if ``c`` is empty, the return
+    value is the action; else the return value is the subsequent compiled
+    partial keymap.
+
+    The compiled keymap satisfies property: Action is not None if and only if
+    """
+    for child in tree.children:
+        if c == child.val:
+            if child.action:
+                return None, child.action
+            else:
+                return child, None
+    else:
+        return None, None
+
+
+def loop(player: VideoPlayer, paused=False, startat=0,
+         show_progress_when_goto='auto'):
+    _it = range(startat)
+    _quiet = player.quiet
+    if not player.quiet:
+        if show_progress_when_goto == 'never':
+            player.quiet = True
+        elif show_progress_when_goto == 'auto' and startat < 100:
+            player.quiet = True
+    player.skip(n=startat)
+    player.quiet = _quiet
+    if paused:
+        player.pause()
+
+    kmtree = compile_keymap()
+    kmtree_partial = kmtree
+    kseqhistory = []  # only for human-friendly purpose
+
+    key = player.render()
+    if key is not None:
+        kmtree_partial, reaction = traverse_kmtree(kmtree, key)
+        kseqhistory.append(key)
+    else:
+        reaction = 'do_nothing'
+    while reaction != 'quit':
+        if key is None:
+            player.do_nothing()
+        elif reaction == 'help':
+            print(__keymap_instruction__)
+            kmtree_partial = kmtree
+            kseqhistory = []
+        elif reaction:
+            try:
+                action = getattr(player, reaction)
+            except TypeError:
+                reaction, arg = reaction
+                action = getattr(player, reaction)
+                action = partial(action, arg)
+            kmtree_partial = kmtree
+            try:
+                action()
+            except IllegalStateError as e:
+                if not player.quiet:
+                    print(e, file=sys.stderr)
+            kseqhistory = []
+        elif kmtree_partial:
+            player.do_nothing()
+        else:
+            print('Error matching key sequence `{}\''.format(''.join(kseqhistory)),
+                  file=sys.stderr)
+            kseqhistory = []
+            player.do_nothing()
+            kmtree_partial = kmtree
+        key = player.render()
+        if key is not None:
+            kmtree_partial, reaction = traverse_kmtree(kmtree_partial, key)
+            kseqhistory.append(key)
+        else:
+            reaction = 'do_nothing'
+
+
+if __name__ == '__main__':
+    args = make_parser().parse_args()
+    if not args.videos:
+        if not args.quiet:
+            print('Nothing to play')
+        sys.exit(0)
+
+    caps = []
+    if args.videos[0] == '-':
+        if not sys.stdin.isatty():
+            args.videos = list(map(os.path.normpath,
+                                   map(str.strip, sys.stdin.readlines())))
+            if args.videos is None or not len(args.videos):
+                if not args.quiet:
+                    print('Nothing to play')
+                sys.exit(0)
+        else:
+            if not args.quiet:
+                print('Expecting input from stdin', file=sys.stderr)
+            sys.exit(1)
+    if args.locations:
+        if len(args.locations) < len(args.videos):
+            if not args.quiet:
+                print('Locations are not specified for some videos;'
+                      ' aborted', file=sys.stderr)
+            sys.exit(1)
+        for l, v in zip(args.locations, args.videos):
+            caps.append((l, cv2.VideoCapture(v)))
+    else:
+        nrows, ncols = args.grid_shape
+        try:
+            nrows = int(nrows)
+        except (TypeError, ValueError):
+            ncols = int(ncols)
+            nrows = math.ceil(len(args.videos) / ncols)
+        else:
+            try:
+                ncols = int(ncols)
+            except (TypeError, ValueError):
+                ncols = math.ceil(len(args.videos) / nrows)
+        for i, v in enumerate(args.videos):
+            caps.append(((i // ncols, i % ncols), cv2.VideoCapture(v)))
+    iters = [(tuple(map(int, l)), frameiter(cap, rgb=False))
+             for l, cap in caps]
+    fproc = []
+    if args.routine:
+        for routine_file in args.routine:
+            mod = import_routine(routine_file)
+            try:
+                fproc.append(mod.frame_processor())
+            except AttributeError:
+                print('Expecting function `frame_processor` in "{}" that '
+                      'returns the callable frame processor'
+                      .format(routine_file), file=sys.stderr)
+                raise
+
+    player = VideoPlayer(*iters, colored=args.colored, fps=args.fps,
+                         rewind_limit=args.cache, frame_processors=fproc,
+                         n_cpu=args.max_procs)
+    player.quiet = args.quiet
+    try:
+        loop(player, paused=args.freeze_once_start,
+             startat=1 + args.start_frame,
+             show_progress_when_goto=args.show_progress_when_goto)
+    finally:
+        player.close()
+        for _, cap in caps:
+            cap.release()
