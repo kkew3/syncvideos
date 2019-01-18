@@ -8,11 +8,15 @@ Play videos synchronously with automatic window placement by arranging windows i
 
 - **b**: freeze the videos;
 - **c**: continue playing the videos;
-- **g**: show progress on console;
+- **g**: show current frame ID on console;
+- **Ng**: show current ID plus "/`N`", where `N` is a digit (0-9)
 - **h**: show help on console;
+- **Nj**: when current frame is the latest, skip `N` frames forward, where `N` should be a positive integer ranging from 2 to 999 (inclusive)
 - **l**: go to the earliest frame within the rewind limit;
 - **n**: go to next frame;
+- **Nn**: repeat `n` for `N` times, until the latest frame, `N` should be a positive integer ranging from 2 to 999 (inclusive)
 - **p**: go to previous frame;
+- **Np**: repeat `p` for `N` times, until the rewind limit, `N` should be a positive integer ranging from 2 to 999 (inclusive)
 - **r**: go to the latest frame.
 
 To interact using above keymaps, the window focus should be on one of the opencv video windows rather than the console.
@@ -20,37 +24,42 @@ To interact using above keymaps, the window focus should be on one of the opencv
 
 ## Detailed help
 
-> Copied from `play-videos.py --help`
+> Copied from `playvideos.py --help`
 
 ```plain
-usage: play-videos.py [-h] [-f VIDEO] [-L NROWS NCOLS] [-l X Y] [--fps FPS]
-                      [-c {rgb,gray}] [-r FILE] [-b] [-n CACHE] [-g FRAME_ID]
-                      [-q]
+usage: playvideos.py [-h] [-f VIDEO] [-L NROWS NCOLS] [-l X Y] [--fps FPS]
+                     [-c] [-r FILE] [-b] [-n CACHE] [-P [MAX_PROCS]]
+                     [-g START_FRAME_ID] [--progress {never,auto,always}] [-q]
 
 Play videos synchronously with automatic window placement.
 
 Keymaps
 -------
 
-    b) freeze the videos;
-    c) continue playing the videos;
-    g) show progress on console;
-    h) show help on console;
-    l) go to the earliest frame within the rewind limit;
-    n) go to next frame;
-    p) go to previous frame already played;
-    r) go to the latest frame.
+    b)    pause the videos;
+    c)    continue playing the videos at normal speed;
+    [N]g) show current frame ID on console; if N is provided, where N is one
+          digit (0-9), what will be printed is "$frame_id/$N"
+    h)    show help on console;
+    [N]j) skip N new frames; this command fails unless following `r'
+    l)    go to the earliest frame within the rewind limit;
+    n)    go to the next frame
+    Nn)   repeat `n' N times until hitting the frame induced by `r';
+    [N]p) repeat `p' N times until hitting the frame induced by `l';
+    r)    go to the latest frame already played.
+
+    where N is a positive integer
 
 Example
 -------
 
 Play `video1' and `video1' side-by-side:
 
-    python play-videos.py -f video1 -l 0 0 -f video2 -l 0 1;
+    python playvideos.py -f video1 -l 0 0 -f video2 -l 0 1;
 
 Arrange all AVI videos in two rows:
 
-    find . -name '*.avi' -print | python play-videos.py -f- -L 2 x
+    find . -name '*.avi' -print | python playvideos.py -f- -L 2 x
 
 Custom frame preprocessing routine
 ----------------------------------
@@ -60,16 +69,16 @@ The routines will be chained such that the result from the ith routine
 will be fed as input into the (i+1)th routine. Each file defines one and
 only one routine.
 
+The files defining a routine should be named such that it can be imported.
 Each file defining a routine must contain a function named `frame_processor`
 that expects no argument and returns a callable object, denoted as `fp`. The
 callable object should behave the same as the following function signature:
 
-    def fp(cl_frames: List[Tuple[Tuple[int, int], Optional[numpy.ndarray]]]) \
-            -> List[Tuple[Tuple[int, int], Optional[numpy.ndarray]]]:
-        ...
+    Callable[[List[Tuple[Tuple[int, int], Optional[np.ndarray]]]],
+             List[Tuple[Tuple[int, int], Optional[np.ndarray]]]]
 
-`cl_frames' is a list of tuples (cell_location, frame).
-For example,
+where the input argument `cl_frames' is a list of tuples
+(cell_location, frame). For example,
 
     [((0,0),frame1), ((0,1),frame2), ((1,0),frame3)]
 
@@ -83,9 +92,8 @@ is equivalent to
 
     [((0,0),frame1), ((0,1),frame2), ((1,0),frame3), ((1,1),None)]
 
-The returned value is of the same format
-as the input list, but does not necessarily maintain the same length.
-For example, given the input list
+The returned value is of the same format as the input list, but does not
+necessarily maintain the same length. For example, given the input list
 
     [((0,0),frame1), ((0,1),frame2)]
 
@@ -113,8 +121,8 @@ Layout specification:
 
 Video specification:
   --fps FPS             the frame-per-second; default to 6.0
-  -c {rgb,gray}, --color {rgb,gray}
-                        rgb video or gray video; default to gray
+  -c, --colored         to load frames in BGR color; if not specified, load
+                        frames in grayscale
 
 Frame processors:
   -r FILE, --routine FILE
@@ -130,8 +138,17 @@ Runtime behavior:
                         frames on the run. The reason why ffmpeg backend is
                         not used because it is not reliable (see
                         https://github.com/opencv/opencv/issues/9053).
-  -g FRAME_ID, --goto FRAME_ID
-                        Start the videos at frame FRAME_ID
+  -P [MAX_PROCS], --max-procs [MAX_PROCS]
+                        specify this option to enable multiprocessing. The
+                        number of CPU cores allocated will be MAX_PROCS if
+                        it's positive. Default to disable multiprocessing
+  -g START_FRAME_ID, --goto START_FRAME_ID
+                        Start the videos at frame START_FRAME_ID
+  --progress {never,auto,always}
+                        whether to show progress bar when using `--goto'
+                        option; default to `auto', where progress bar is shown
+                        when START_FRAME_ID is at least 100. Option `--quiet'
+                        implies `--progress never'
   -q, --quiet
 ```
 
